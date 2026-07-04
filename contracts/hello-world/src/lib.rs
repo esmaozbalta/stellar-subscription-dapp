@@ -1,23 +1,30 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, vec, Env, String, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, Env, Address, symbol_short};
 
-#[contract]
-pub struct Contract;
-
-// This is a sample contract. Replace this placeholder with your own contract logic.
-// A corresponding test example is available in `test.rs`.
-//
-// For comprehensive examples, visit <https://github.com/stellar/soroban-examples>.
-// The repository includes use cases for the Stellar ecosystem, such as data storage on
-// the blockchain, token swaps, liquidity pools, and more.
-//
-// Refer to the official documentation:
-// <https://developers.stellar.org/docs/build/smart-contracts/overview>.
-#[contractimpl]
-impl Contract {
-    pub fn hello(env: Env, to: String) -> Vec<String> {
-        vec![&env, String::from_str(&env, "Hello"), to]
-    }
+#[contracttype]
+pub enum DataKey {
+    Expiration(Address),
 }
 
-mod test;
+#[contract]
+pub struct SubscriptionRegistry;
+
+#[contractimpl]
+impl SubscriptionRegistry {
+    pub fn extend(env: Env, user: Address, days: u64) {
+        let key = DataKey::Expiration(user.clone());
+        let current_exp: u64 = env.storage().persistent().get(&key).unwrap_or(0);
+        
+        let now = env.ledger().timestamp();
+        let base_time = if current_exp > now { current_exp } else { now };
+
+        let new_exp = base_time + (days * 86400);
+        env.storage().persistent().set(&key, &new_exp);
+
+        env.events().publish((symbol_short!("sub"), symbol_short!("extend")), (user, new_exp));
+    }
+
+    pub fn get_exp(env: Env, user: Address) -> u64 {
+        env.storage().persistent().get(&DataKey::Expiration(user)).unwrap_or(0)
+    }
+}
