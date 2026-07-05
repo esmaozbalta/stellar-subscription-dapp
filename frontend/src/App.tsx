@@ -6,13 +6,22 @@ import {
   signTransaction,
 } from '@stellar/freighter-api';
 import {
+  Account,
   Address,
   Contract,
   Networks,
   TransactionBuilder,
   nativeToScVal,
   rpc,
+  scValToNative,
 } from '@stellar/stellar-sdk';
+import {
+  truncateAddress,
+  parseErrorMessage,
+  formatTxErrorResult,
+  formatExpirationDate,
+  daysRemaining,
+} from './utils';
 
 const SOROBAN_RPC = 'https://soroban-testnet.stellar.org';
 const HORIZON_URL = 'https://horizon-testnet.stellar.org';
@@ -23,53 +32,11 @@ const REGISTRY_ID = import.meta.env.VITE_REGISTRY_ID ?? '';
 const SUBSCRIPTION_PRICE_XLM = 50;
 const SUBSCRIPTION_DAYS = 30;
 const MIN_BALANCE_BUFFER = 1;
+const TX_POLL_INTERVAL_MS = 1000;
+const TX_POLL_MAX_ATTEMPTS = 10;
 
 type LoadingState = 'idle' | 'connecting' | 'subscribing';
-
-function truncateAddress(address: string): string {
-  if (address.length <= 12) return address;
-  return `${address.slice(0, 4)}…${address.slice(-4)}`;
-}
-
-function parseErrorMessage(error: unknown): string {
-  const raw =
-    error instanceof Error
-      ? error.message
-      : typeof error === 'string'
-        ? error
-        : 'Something went wrong. Please try again.';
-
-  const lower = raw.toLowerCase();
-
-  if (
-    lower.includes('insufficient') ||
-    lower.includes('underfunded') ||
-    lower.includes('not enough')
-  ) {
-    return 'Insufficient balance';
-  }
-  if (
-    lower.includes('user declined') ||
-    lower.includes('user rejected') ||
-    lower.includes('access denied') ||
-    lower.includes('denied')
-  ) {
-    return 'Transaction cancelled';
-  }
-  if (
-    lower.includes('freighter') ||
-    lower.includes('not installed') ||
-    lower.includes('connection') ||
-    lower.includes('not connected')
-  ) {
-    return 'Connection failed';
-  }
-  if (lower.includes('contract not configured')) {
-    return 'Service unavailable. Contract not configured.';
-  }
-
-  return raw.length > 120 ? `${raw.slice(0, 120)}…` : raw;
-}
+type SubscriptionStatus = 'Active' | 'Inactive' | null;
 
 async function fetchNativeBalance(publicKey: string): Promise<number> {
   const response = await fetch(`${HORIZON_URL}/accounts/${publicKey}`);
@@ -90,11 +57,111 @@ async function fetchNativeBalance(publicKey: string): Promise<number> {
   return native ? parseFloat(native.balance) : 0;
 }
 
+// Waits for a submitted transaction to land on-chain before we re-read
+// contract state. sendTransaction only confirms *submission*, not
+// confirmation, so reading state immediately after can race the ledger.
+async function waitForTransactionConfirmation(
+  server: rpc.Server,
+  hash: string,
+): Promise<boolean> {
+  for (let attempt = 0; attempt < TX_POLL_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      const response = await server.getTransaction(hash);
+      if (response.status === rpc.Api.GetTransactionStatus.SUCCESS) {
+        return true;
+      }
+      if (response.status === rpc.Api.GetTransactionStatus.FAILED) {
+        return false;
+      }
+    } catch {
+      /* not yet available, keep polling */
+    }
+    await new Promise((resolve) => setTimeout(resolve, TX_POLL_INTERVAL_MS));
+  }
+  // Timed out waiting — don't throw, the tx may still confirm shortly after.
+  return false;
+}
+
 export default function App() {
   const [walletAddress, setWalletAddress] = useState<string | null>(null);
+  const [subscriptionStatus, setSubscriptionStatus] =
+    useState<SubscriptionStatus>(null);
+  const [expiration, setExpiration] = useState<number>(0);
   const [loading, setLoading] = useState<LoadingState>('idle');
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
+  const [justSubscribed, setJustSubscribed] = useState(false);
+
+  const checkSubscriptionStatus = useCallback(async (address: string) => {
+    if (!REGISTRY_ID) {
+      setSubscriptionStatus(null);
+      setExpiration(0);
+      return;
+    }
+
+    try {
+      const server = new rpc.Server(SOROBAN_RPC);
+      const contract = new Contract(REGISTRY_ID);
+
+      let sourceAccount: Account;
+      try {
+        sourceAccount = await server.getAccount(address);
+      } catch {
+        sourceAccount = new Account(address, '0');
+      }
+
+      const userScVal = Address.fromString(address).toScVal();
+
+      const statusTx = new TransactionBuilder(sourceAccount, {
+        fee: '100',
+        networkPassphrase: NETWORK_PASSPHRASE,
+      })
+        .addOperation(contract.call('get_status', userScVal))
+        .setTimeout(30)
+        .build();
+
+      const expTx = new TransactionBuilder(sourceAccount, {
+        fee: '100',
+        networkPassphrase: NETWORK_PASSPHRASE,
+      })
+        .addOperation(contract.call('get_exp', userScVal))
+        .setTimeout(30)
+        .build();
+
+      const [statusSim, expSim] = await Promise.all([
+        server.simulateTransaction(statusTx),
+        server.simulateTransaction(expTx),
+      ]);
+
+      if (rpc.Api.isSimulationError(statusSim)) {
+        throw new Error(
+          statusSim.error ||
+            'Failed to read subscription status from the registry contract',
+        );
+      }
+
+      if (!rpc.Api.isSimulationSuccess(statusSim) || !statusSim.result?.retval) {
+        setSubscriptionStatus('Inactive');
+      } else {
+        const status = scValToNative(statusSim.result.retval);
+        setSubscriptionStatus(status === 'Active' ? 'Active' : 'Inactive');
+      }
+
+      if (
+        rpc.Api.isSimulationSuccess(expSim) &&
+        expSim.result?.retval
+      ) {
+        const exp = scValToNative(expSim.result.retval);
+        setExpiration(typeof exp === 'bigint' ? Number(exp) : Number(exp ?? 0));
+      } else {
+        setExpiration(0);
+      }
+    } catch (err) {
+      console.error('Failed to check subscription status:', err);
+      setSubscriptionStatus(null);
+      setExpiration(0);
+    }
+  }, []);
 
   const restoreSession = useCallback(async () => {
     try {
@@ -113,6 +180,16 @@ export default function App() {
   useEffect(() => {
     void restoreSession();
   }, [restoreSession]);
+
+  useEffect(() => {
+    if (!walletAddress) {
+      setSubscriptionStatus(null);
+      setExpiration(0);
+      return;
+    }
+
+    void checkSubscriptionStatus(walletAddress);
+  }, [walletAddress, checkSubscriptionStatus]);
 
   const handleConnect = async () => {
     setError(null);
@@ -140,9 +217,19 @@ export default function App() {
     }
   };
 
+  const handleDisconnect = () => {
+    setWalletAddress(null);
+    setSubscriptionStatus(null);
+    setExpiration(0);
+    setError(null);
+    setSuccess(null);
+    setJustSubscribed(false);
+  };
+
   const handleSubscribe = async () => {
     setError(null);
     setSuccess(null);
+    setJustSubscribed(false);
 
     if (!walletAddress) {
       setError('Connect your wallet to subscribe.');
@@ -151,6 +238,11 @@ export default function App() {
 
     if (!PAYMENT_EXECUTOR_ID || !REGISTRY_ID) {
       setError('Service unavailable. Contract not configured.');
+      return;
+    }
+
+    if (subscriptionStatus === 'Active') {
+      setError('Your plan is already active.');
       return;
     }
 
@@ -202,14 +294,25 @@ export default function App() {
       const result = await server.sendTransaction(signedTx);
 
       if (result.status === 'ERROR') {
-        throw new Error(
-          result.errorResult?.toString() ?? 'Transaction failed on network',
-        );
+        throw new Error(formatTxErrorResult(result.errorResult));
       }
 
+      // Wait for on-chain confirmation before re-reading subscription state,
+      // otherwise we may read stale data from before the extend() call landed.
+      await waitForTransactionConfirmation(server, result.hash);
+
+      await checkSubscriptionStatus(walletAddress);
+      setJustSubscribed(true);
       setSuccess('Subscription active. Your storage plan is now extended.');
     } catch (err) {
-      setError(parseErrorMessage(err));
+      console.error('Contract interaction failed during subscribe:', err);
+
+      if (err instanceof SyntaxError) {
+        console.error('JSON parse error during contract interaction:', err);
+        setError('Received an invalid response from the network. Please try again.');
+      } else {
+        setError(parseErrorMessage(err));
+      }
     } finally {
       setLoading('idle');
     }
@@ -218,6 +321,9 @@ export default function App() {
   const isConnecting = loading === 'connecting';
   const isSubscribing = loading === 'subscribing';
   const isBusy = loading !== 'idle';
+  const isActive = subscriptionStatus === 'Active';
+  const remaining = daysRemaining(expiration);
+  const expirationLabel = expiration ? formatExpirationDate(expiration) : '';
 
   return (
     <>
@@ -422,6 +528,13 @@ export default function App() {
           background: #0a0a0a;
         }
 
+        .vault-expiration {
+          margin: 0;
+          font-size: 12px;
+          letter-spacing: 0.04em;
+          color: #737373;
+        }
+
         .vault-feedback {
           min-height: 20px;
           font-size: 13px;
@@ -468,11 +581,7 @@ export default function App() {
                   type="button"
                   className="vault-btn vault-btn--outline"
                   disabled={isBusy}
-                  onClick={() => {
-                    setWalletAddress(null);
-                    setError(null);
-                    setSuccess(null);
-                  }}
+                  onClick={handleDisconnect}
                 >
                   Disconnect
                 </button>
@@ -510,26 +619,38 @@ export default function App() {
               <li>Instant activation after confirmation</li>
             </ul>
 
+            {isActive && expirationLabel && (
+              <p className="vault-expiration">
+                Renews on {expirationLabel} · {remaining} day
+                {remaining === 1 ? '' : 's'} remaining
+              </p>
+            )}
+
             <hr className="vault-divider" />
 
             <div className="vault-feedback" role="status" aria-live="polite">
               {error && <p className="vault-error">{error}</p>}
-              {!error && success && (
+              {!error && justSubscribed && success && (
                 <p className="vault-success">{success}</p>
+              )}
+              {!error && !justSubscribed && isActive && (
+                <p className="vault-success">Your plan is already active.</p>
               )}
             </div>
 
             <button
               type="button"
               className="vault-btn"
-              disabled={isBusy || !walletAddress}
+              disabled={isBusy || !walletAddress || isActive}
               onClick={() => void handleSubscribe()}
             >
               {isSubscribing
                 ? 'Processing transaction…'
-                : walletAddress
-                  ? 'Subscribe'
-                  : 'Connect wallet to subscribe'}
+                : isActive
+                  ? 'Plan active'
+                  : walletAddress
+                    ? 'Subscribe'
+                    : 'Connect wallet to subscribe'}
             </button>
           </article>
 
